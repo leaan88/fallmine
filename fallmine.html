@@ -1,0 +1,628 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>FALLMINE</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin:0; background:#0b0b0f; color:#eaeaf2; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+    .wrap { display:flex; gap:16px; justify-content:center; padding:16px; align-items:flex-start; }
+    canvas { background:#000; border:1px solid #222; image-rendering: pixelated; }
+    .panel { width:260px; }
+    .card { border:1px solid #222; background:#0f0f16; padding:12px; margin-bottom:12px; }
+    .row { display:flex; justify-content:space-between; gap:12px; }
+    .k { opacity:.8 }
+    .v { font-weight:700 }
+    .small { font-size:12px; opacity:.85; line-height:1.4 }
+    .title { font-weight:900; letter-spacing:.6px; margin:0 0 8px 0; }
+    .btn { display:inline-block; padding:8px 10px; border:1px solid #2a2a3a; background:#141421; cursor:pointer; user-select:none; }
+    .btn:hover { background:#1a1a2a; }
+    .mono { font-variant-numeric: tabular-nums; }
+    .tag { display:inline-block; padding:2px 6px; border:1px solid #2a2a3a; border-radius:999px; font-size:11px; opacity:.9; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <canvas id="game" width="360" height="720"></canvas>
+
+    <div class="panel">
+      <div class="card">
+        <h3 class="title">FALLMINE <span class="tag">v1.0</span></h3>
+        <div class="row mono"><div class="k">Score</div><div class="v" id="score">0</div></div>
+        <div class="row mono"><div class="k">Level</div><div class="v" id="level">1</div></div>
+        <div class="row mono"><div class="k">Lines</div><div class="v" id="lines">0</div></div>
+        <div class="row mono"><div class="k">Bomb rate</div><div class="v" id="bombRate">12%</div></div>
+        <div class="row mono"><div class="k">Detonator</div><div class="v" id="detCd">READY</div></div>
+      </div>
+
+      <div class="card small">
+        <div><b>Controles</b></div>
+        <div>← → mover | ↑ rotar | ↓ caer</div>
+        <div><b>Espacio</b> detonador (bombas 4-dir adyacentes a la pieza)</div>
+        <div><b>C</b> hold | <b>P</b> pausa | <b>R</b> reiniciar</div>
+        <hr style="border-color:#222">
+        <div><b>Reglas clave</b></div>
+        <div>- Bombas latentes: explotan por línea completa, cadena o detonador.</div>
+        <div>- Números aparecen <b>solo</b> tras explosión cercana y viajan con el bloque.</div>
+        <div>- Destruir bloques numerados penaliza: conservar info vale.</div>
+      </div>
+
+      <div class="card">
+        <div class="btn" id="btnPause">Pausa (P)</div>
+        <div class="btn" id="btnRestart" style="margin-left:8px;">Reiniciar (R)</div>
+      </div>
+
+      <div class="card small" id="status"></div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  // ====== CONFIG ======
+  const COLS = 10, ROWS = 20;
+  const SIZE = 36; // canvas cell size
+  const CANVAS_W = COLS * SIZE;
+  const CANVAS_H = ROWS * SIZE;
+
+  const BOMB_BASE = 0.12;      // 12%
+  const DETONATOR_COOLDOWN_MS = 5000;
+
+  const SCORE = {
+    bomb: 100,
+    chainBomb: 150,
+    reveal: 20,
+    lineClear: 300,
+    destroyNumber: -50,
+    hardDropCell: 2
+  };
+
+  // Explosion cross radius=1 (center + 4-dir)
+  const CROSS = [[0,0],[1,0],[-1,0],[0,1],[0,-1]];
+
+  // ====== CANVAS ======
+  const canvas = document.getElementById("game");
+  canvas.width = CANVAS_W; canvas.height = CANVAS_H;
+  const ctx = canvas.getContext("2d");
+  ctx.font = "16px ui-monospace, monospace";
+  ctx.textBaseline = "middle";
+  ctx.textAlign = "center";
+
+  // ====== UI ======
+  const elScore = document.getElementById("score");
+  const elLevel = document.getElementById("level");
+  const elLines = document.getElementById("lines");
+  const elBombRate = document.getElementById("bombRate");
+  const elDetCd = document.getElementById("detCd");
+  const elStatus = document.getElementById("status");
+  const btnPause = document.getElementById("btnPause");
+  const btnRestart = document.getElementById("btnRestart");
+
+  // ====== STATE ======
+  let grid, piece, nextPiece, holdPiece = null, holdUsed = false;
+  let score = 0, lines = 0, level = 1;
+  let tickMs = 650;
+  let paused = false, gameOver = false;
+
+  let lastDetonationAt = -Infinity;
+
+  // cell structure: { bomb:boolean, num:number|null, revealed:boolean, color:string }
+  const emptyRow = () => Array.from({length: COLS}, () => null);
+
+  // ====== TETROMINOS ======
+  const TETROS = [
+    { name:"I", color:"#00c2ff", shape:[[1,1,1,1]] },
+    { name:"O", color:"#ffd000", shape:[[1,1],[1,1]] },
+    { name:"T", color:"#b86bff", shape:[[0,1,0],[1,1,1]] },
+    { name:"S", color:"#3bff7a", shape:[[0,1,1],[1,1,0]] },
+    { name:"Z", color:"#ff4b4b", shape:[[1,1,0],[0,1,1]] },
+    { name:"L", color:"#ff9a2e", shape:[[1,0,0],[1,1,1]] },
+    { name:"J", color:"#3b6cff", shape:[[0,0,1],[1,1,1]] },
+  ];
+
+  function cloneShape(s) { return s.map(r => r.slice()); }
+
+  function rotateCW(shape) {
+    const h = shape.length, w = shape[0].length;
+    const out = Array.from({length:w}, () => Array(h).fill(0));
+    for (let y=0;y<h;y++) for (let x=0;x<w;x++) out[x][h-1-y] = shape[y][x];
+    return out;
+  }
+
+  function newRandomPiece() {
+    const t = TETROS[(Math.random() * TETROS.length) | 0];
+    const shape = cloneShape(t.shape);
+    return { name: t.name, color: t.color, shape, x: 3, y: 0 };
+  }
+
+  // ====== COLLISION ======
+  function inBounds(x,y){ return x>=0 && x<COLS && y>=0 && y<ROWS; }
+
+  function collides(px, py, shape) {
+    for (let y=0;y<shape.length;y++) {
+      for (let x=0;x<shape[y].length;x++) {
+        if (!shape[y][x]) continue;
+        const gx = px+x, gy = py+y;
+        if (gx < 0 || gx >= COLS || gy >= ROWS) return true;
+        if (gy >= 0 && grid[gy][gx]) return true;
+      }
+    }
+    return false;
+  }
+
+  function ghostY() {
+    let gy = piece.y;
+    while (!collides(piece.x, gy+1, piece.shape)) gy++;
+    return gy;
+  }
+
+  // ====== BOMB RATE SCALING ======
+  function bombRate() {
+    // leveleo suave: +0.6% cada nivel, clamp 26%
+    const r = Math.min(0.26, BOMB_BASE + (level-1)*0.006);
+    return r;
+  }
+
+  // ====== PLACE PIECE ======
+  function placePiece() {
+    const r = bombRate();
+    for (let y=0;y<piece.shape.length;y++) {
+      for (let x=0;x<piece.shape[y].length;x++) {
+        if (!piece.shape[y][x]) continue;
+        const gx = piece.x + x;
+        const gy = piece.y + y;
+        if (gy < 0) { // spawned into collision => game over
+          gameOver = true;
+          return;
+        }
+        const hasBomb = Math.random() < r;
+        grid[gy][gx] = { bomb: hasBomb, num: null, revealed: false, color: piece.color };
+      }
+    }
+    holdUsed = false;
+
+    // Trigger chain from full lines (bombs in full row start detonations)
+    resolveAfterPlacement();
+
+    // Spawn next
+    piece = nextPiece;
+    piece.x = 3; piece.y = 0;
+    nextPiece = newRandomPiece();
+
+    if (collides(piece.x, piece.y, piece.shape)) {
+      gameOver = true;
+    }
+  }
+
+  // ====== DETONATION SYSTEM ======
+  // Detonate bombs at positions (set), apply explosion cross, chain if hits bomb
+  function detonateBombs(initialBombPositions) {
+    // BFS over bombs reached by adjacency (4-dir) via explosion hits
+    const q = [...initialBombPositions];
+    const seen = new Set(q.map(p => `${p.x},${p.y}`));
+    let chainCount = 0;
+
+    // track explosion-cleared cells for "reveal numbers near explosions"
+    const cleared = new Set();
+
+    while (q.length) {
+      const b = q.shift();
+      if (!inBounds(b.x,b.y)) continue;
+      const cell = grid[b.y][b.x];
+      if (!cell || !cell.bomb) continue;
+
+      // score bomb + chain bonus after first
+      score += (chainCount === 0) ? SCORE.bomb : SCORE.chainBomb;
+      chainCount++;
+
+      // Remove bomb center itself (counts as destroyed cell)
+      if (cell.num !== null) score += SCORE.destroyNumber;
+      grid[b.y][b.x] = null;
+      cleared.add(`${b.x},${b.y}`);
+
+      // Cross explosion
+      for (const [dx,dy] of CROSS) {
+        const nx = b.x + dx, ny = b.y + dy;
+        if (!inBounds(nx,ny)) continue;
+        const target = grid[ny][nx];
+        if (!target) continue;
+
+        // penalize if destroying numbered block
+        if (target.num !== null) score += SCORE.destroyNumber;
+
+        // if bomb, enqueue for chain (but still remove this tile now)
+        if (target.bomb) {
+          const key = `${nx},${ny}`;
+          if (!seen.has(key)) { seen.add(key); q.push({x:nx,y:ny}); }
+        }
+        grid[ny][nx] = null;
+        cleared.add(`${nx},${ny}`);
+      }
+    }
+
+    // Reveal numbers only for blocks adjacent (8-dir) to any cleared-by-explosion cell
+    revealNumbersNearCleared(cleared);
+
+    // Gravity settle
+    settleGravity();
+  }
+
+  function revealNumbersNearCleared(clearedSet) {
+    // collect neighbors to reveal
+    const toReveal = new Set();
+    for (const key of clearedSet) {
+      const [cx, cy] = key.split(",").map(Number);
+      for (let dy=-1;dy<=1;dy++) for (let dx=-1;dx<=1;dx++) {
+        if (dx===0 && dy===0) continue;
+        const nx=cx+dx, ny=cy+dy;
+        if (!inBounds(nx,ny)) continue;
+        if (!grid[ny][nx]) continue;
+        toReveal.add(`${nx},${ny}`);
+      }
+    }
+
+    for (const key of toReveal) {
+      const [x,y] = key.split(",").map(Number);
+      const cell = grid[y][x];
+      if (!cell) continue;
+      // reveal only once; then it persists
+      if (cell.num === null) {
+        cell.num = countAdjacentBombs(x,y);
+        cell.revealed = true;
+        score += SCORE.reveal;
+      }
+    }
+  }
+
+  function countAdjacentBombs(x,y) {
+    let n=0;
+    for (let dy=-1;dy<=1;dy++) for (let dx=-1;dx<=1;dx++) {
+      if (dx===0 && dy===0) continue;
+      const nx=x+dx, ny=y+dy;
+      if (!inBounds(nx,ny)) continue;
+      if (grid[ny][nx]?.bomb) n++;
+    }
+    return n;
+  }
+
+  function settleGravity() {
+    // Per-column settle until stable
+    for (let x=0;x<COLS;x++) {
+      let write = ROWS-1;
+      for (let y=ROWS-1;y>=0;y--) {
+        const cell = grid[y][x];
+        if (cell) {
+          if (y !== write) {
+            grid[write][x] = cell;
+            grid[y][x] = null;
+          }
+          write--;
+        }
+      }
+      for (let y=write;y>=0;y--) grid[y][x] = null;
+    }
+  }
+
+  // ====== LINES ======
+  function fullRows() {
+    const rows = [];
+    for (let y=0;y<ROWS;y++) {
+      let full = true;
+      for (let x=0;x<COLS;x++) if (!grid[y][x]) { full=false; break; }
+      if (full) rows.push(y);
+    }
+    return rows;
+  }
+
+  function clearFullRows(rows) {
+    // award; remove rows; drop above
+    if (!rows.length) return;
+    rows.sort((a,b)=>a-b);
+    for (const y of rows) {
+      grid.splice(y,1);
+      grid.unshift(emptyRow());
+      lines++;
+      score += SCORE.lineClear;
+    }
+    updateLevel();
+  }
+
+  // On placement:
+  // 1) find full rows
+  // 2) bombs in those rows detonate first (can break rows)
+  // 3) after detonations+gravity, repeatedly clear any truly full rows
+  function resolveAfterPlacement() {
+    // Step A: trigger detonations from bombs inside initially full rows
+    const rows = fullRows();
+    if (rows.length) {
+      const bombsToDetonate = [];
+      for (const y of rows) for (let x=0;x<COLS;x++) if (grid[y][x]?.bomb) bombsToDetonate.push({x,y});
+      if (bombsToDetonate.length) detonateBombs(bombsToDetonate);
+    }
+
+    // Step B: after explosions, clear any remaining full rows (repeat until none)
+    while (true) {
+      const rows2 = fullRows();
+      if (!rows2.length) break;
+
+      // If any bombs remain in those rows, they should trigger again before clearing
+      const bombsToDetonate2 = [];
+      for (const y of rows2) for (let x=0;x<COLS;x++) if (grid[y][x]?.bomb) bombsToDetonate2.push({x,y});
+      if (bombsToDetonate2.length) {
+        detonateBombs(bombsToDetonate2);
+        continue; // re-evaluate rows after gravity
+      }
+
+      clearFullRows(rows2);
+      settleGravity();
+    }
+  }
+
+  function updateLevel() {
+    // Level up every 10 lines; speed scales
+    level = 1 + Math.floor(lines / 10);
+    tickMs = Math.max(180, 650 - (level-1) * 45);
+  }
+
+  // ====== MANUAL DETONATOR ======
+  function canDetonateNow() {
+    return (performance.now() - lastDetonationAt) >= DETONATOR_COOLDOWN_MS;
+  }
+
+  function manualDetonate() {
+    if (!canDetonateNow() || gameOver) return;
+
+    // Detonates bombs 4-dir adjacent to any block of the active piece (at its current position)
+    const bombs = [];
+    for (let y=0;y<piece.shape.length;y++) for (let x=0;x<piece.shape[y].length;x++) {
+      if (!piece.shape[y][x]) continue;
+      const gx = piece.x + x;
+      const gy = piece.y + y;
+      for (const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+        const nx=gx+dx, ny=gy+dy;
+        if (!inBounds(nx,ny)) continue;
+        if (grid[ny][nx]?.bomb) bombs.push({x:nx,y:ny});
+      }
+    }
+
+    // unique positions
+    const uniq = [];
+    const seen = new Set();
+    for (const b of bombs) {
+      const k = `${b.x},${b.y}`;
+      if (!seen.has(k)) { seen.add(k); uniq.push(b); }
+    }
+
+    if (uniq.length) {
+      lastDetonationAt = performance.now();
+      detonateBombs(uniq);
+      // after detonations, clear full rows (no implicit bomb trigger unless rows full include bombs, handled in loop)
+      while (true) {
+        const rows2 = fullRows();
+        if (!rows2.length) break;
+        const bombsToDetonate2 = [];
+        for (const y of rows2) for (let x=0;x<COLS;x++) if (grid[y][x]?.bomb) bombsToDetonate2.push({x,y});
+        if (bombsToDetonate2.length) { detonateBombs(bombsToDetonate2); continue; }
+        clearFullRows(rows2);
+        settleGravity();
+      }
+    }
+  }
+
+  // ====== HOLD ======
+  function hold() {
+    if (holdUsed || gameOver) return;
+    holdUsed = true;
+    const current = { name: piece.name, color: piece.color, shape: cloneShape(piece.shape), x:3, y:0 };
+    if (!holdPiece) {
+      holdPiece = current;
+      piece = nextPiece;
+      piece.x = 3; piece.y = 0;
+      nextPiece = newRandomPiece();
+    } else {
+      const tmp = holdPiece;
+      holdPiece = current;
+      piece = { name: tmp.name, color: tmp.color, shape: cloneShape(tmp.shape), x:3, y:0 };
+    }
+    if (collides(piece.x,piece.y,piece.shape)) gameOver = true;
+  }
+
+  // ====== INPUT ======
+  function move(dx) {
+    if (!paused && !gameOver && !collides(piece.x+dx, piece.y, piece.shape)) piece.x += dx;
+  }
+  function softDrop() {
+    if (!paused && !gameOver) {
+      if (!collides(piece.x, piece.y+1, piece.shape)) piece.y++;
+      else placePiece();
+    }
+  }
+  function hardDrop() {
+    if (paused || gameOver) return;
+    const gy = ghostY();
+    const dist = gy - piece.y;
+    piece.y = gy;
+    score += dist * SCORE.hardDropCell;
+    placePiece();
+  }
+  function rotate() {
+    if (paused || gameOver) return;
+    const r = rotateCW(piece.shape);
+
+    // simple wall-kick attempts
+    const kicks = [[0,0],[-1,0],[1,0],[-2,0],[2,0]];
+    for (const [kx,ky] of kicks) {
+      if (!collides(piece.x+kx, piece.y+ky, r)) {
+        piece.shape = r;
+        piece.x += kx;
+        piece.y += ky;
+        return;
+      }
+    }
+  }
+
+  document.addEventListener("keydown", (e) => {
+    if (e.repeat) return;
+    const k = e.key;
+    if (k === "p" || k === "P") togglePause();
+    if (k === "r" || k === "R") reset();
+    if (paused || gameOver) {
+      // allow restart/pause only
+      return;
+    }
+    if (k === "ArrowLeft") move(-1);
+    if (k === "ArrowRight") move(1);
+    if (k === "ArrowDown") softDrop();
+    if (k === "ArrowUp") rotate();
+    if (k === " ") manualDetonate();
+    if (k === "c" || k === "C") hold();
+    if (k === "Enter") hardDrop();
+  });
+
+  btnPause.onclick = () => togglePause();
+  btnRestart.onclick = () => reset();
+
+  // ====== RENDER ======
+  function drawCell(x,y,cell) {
+    // block
+    ctx.fillStyle = cell.color || "#777";
+    ctx.fillRect(x*SIZE, y*SIZE, SIZE, SIZE);
+
+    // inner
+    ctx.fillStyle = "rgba(0,0,0,.25)";
+    ctx.fillRect(x*SIZE+2, y*SIZE+2, SIZE-4, SIZE-4);
+
+    // bomb marker (subtle)
+    if (cell.bomb) {
+      ctx.fillStyle = "rgba(255,255,255,.10)";
+      ctx.beginPath();
+      ctx.arc(x*SIZE+SIZE*0.5, y*SIZE+SIZE*0.5, SIZE*0.12, 0, Math.PI*2);
+      ctx.fill();
+    }
+
+    // number (only if revealed)
+    if (cell.num !== null && cell.revealed) {
+      ctx.fillStyle = "rgba(255,255,255,.92)";
+      ctx.fillText(String(cell.num), x*SIZE + SIZE/2, y*SIZE + SIZE/2 + 1);
+    }
+
+    // grid lines
+    ctx.strokeStyle = "rgba(255,255,255,.06)";
+    ctx.strokeRect(x*SIZE+0.5, y*SIZE+0.5, SIZE-1, SIZE-1);
+  }
+
+  function draw() {
+    // bg
+    ctx.clearRect(0,0,CANVAS_W,CANVAS_H);
+
+    // board
+    for (let y=0;y<ROWS;y++) for (let x=0;x<COLS;x++) {
+      const cell = grid[y][x];
+      if (cell) drawCell(x,y,cell);
+      else {
+        // faint grid
+        ctx.strokeStyle = "rgba(255,255,255,.03)";
+        ctx.strokeRect(x*SIZE+0.5, y*SIZE+0.5, SIZE-1, SIZE-1);
+      }
+    }
+
+    // ghost
+    if (!gameOver) {
+      const gy = ghostY();
+      ctx.globalAlpha = 0.18;
+      for (let y=0;y<piece.shape.length;y++) for (let x=0;x<piece.shape[y].length;x++) {
+        if (!piece.shape[y][x]) continue;
+        const gx = piece.x + x, gyy = gy + y;
+        if (gyy < 0) continue;
+        ctx.fillStyle = piece.color;
+        ctx.fillRect(gx*SIZE, gyy*SIZE, SIZE, SIZE);
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // active piece
+    if (!gameOver) {
+      for (let y=0;y<piece.shape.length;y++) for (let x=0;x<piece.shape[y].length;x++) {
+        if (!piece.shape[y][x]) continue;
+        const gx = piece.x + x, gy = piece.y + y;
+        if (gy < 0) continue;
+        ctx.fillStyle = piece.color;
+        ctx.fillRect(gx*SIZE, gy*SIZE, SIZE, SIZE);
+        ctx.fillStyle = "rgba(0,0,0,.25)";
+        ctx.fillRect(gx*SIZE+2, gy*SIZE+2, SIZE-4, SIZE-4);
+        ctx.strokeStyle = "rgba(255,255,255,.08)";
+        ctx.strokeRect(gx*SIZE+0.5, gy*SIZE+0.5, SIZE-1, SIZE-1);
+      }
+    }
+
+    // overlay status
+    if (paused || gameOver) {
+      ctx.fillStyle = "rgba(0,0,0,.55)";
+      ctx.fillRect(0,0,CANVAS_W,CANVAS_H);
+      ctx.fillStyle = "rgba(255,255,255,.95)";
+      ctx.font = "28px ui-monospace, monospace";
+      ctx.fillText(paused ? "PAUSA" : "GAME OVER", CANVAS_W/2, CANVAS_H/2 - 10);
+      ctx.font = "14px ui-monospace, monospace";
+      ctx.fillText("R para reiniciar", CANVAS_W/2, CANVAS_H/2 + 20);
+    }
+
+    // UI
+    elScore.textContent = String(score);
+    elLines.textContent = String(lines);
+    elLevel.textContent = String(level);
+    elBombRate.textContent = Math.round(bombRate()*100) + "%";
+    const cd = Math.max(0, DETONATOR_COOLDOWN_MS - (performance.now()-lastDetonationAt));
+    elDetCd.textContent = cd === 0 ? "READY" : (Math.ceil(cd/100)/10).toFixed(1) + "s";
+    elStatus.innerHTML = `
+      <div><b>Hold:</b> ${holdPiece ? holdPiece.name : "-"}</div>
+      <div><b>Next:</b> ${nextPiece ? nextPiece.name : "-"}</div>
+      <div style="margin-top:8px;opacity:.9">
+        <b>Tip:</b> conservar bloques numerados vale. Provocá explosiones “quirúrgicas”.
+      </div>
+    `;
+  }
+
+  // ====== LOOP ======
+  let acc = 0;
+  let last = performance.now();
+
+  function step(now) {
+    const dt = now - last;
+    last = now;
+
+    if (!paused && !gameOver) {
+      acc += dt;
+      while (acc >= tickMs) {
+        acc -= tickMs;
+        // gravity tick
+        if (!collides(piece.x, piece.y+1, piece.shape)) piece.y++;
+        else placePiece();
+        if (gameOver) break;
+      }
+    }
+
+    draw();
+    requestAnimationFrame(step);
+  }
+
+  // ====== PAUSE/RESET ======
+  function togglePause() { if (!gameOver) paused = !paused; }
+  function reset() {
+    grid = Array.from({length: ROWS}, emptyRow);
+    score = 0; lines = 0; level = 1; tickMs = 650;
+    paused = false; gameOver = false;
+    holdPiece = null; holdUsed = false;
+    piece = newRandomPiece();
+    nextPiece = newRandomPiece();
+    lastDetonationAt = -Infinity;
+    acc = 0;
+  }
+
+  // ====== START ======
+  reset();
+  requestAnimationFrame(step);
+
+})();
+</script>
+</body>
+</html>
